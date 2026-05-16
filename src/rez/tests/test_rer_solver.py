@@ -75,6 +75,14 @@ class TestRerSolver(TestBase):
         self.assertIsNone(s.resolved_packages)
         self.assertTrue(s.failure_description())
 
+    def test_resolved_ephemerals(self) -> None:
+        """pyrer >= 0.1.0-rc.7 surfaces resolved ephemeral ranges."""
+        s = self._make_solver([".feature-1+<3", ".feature-2+"])
+        s.solve()
+        self.assertEqual(s.status, SolverStatus.solved)
+        ephemerals = sorted(str(e) for e in (s.resolved_ephemerals or []))
+        self.assertEqual(ephemerals, [".feature-2+<3"])
+
     def test_resolved_variants_carry_rez_handles(self) -> None:
         """Variants returned by the rer solver round-trip through the
         ``rez.packages.get_variant`` handle protocol used by Resolver."""

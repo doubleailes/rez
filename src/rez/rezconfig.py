@@ -404,10 +404,9 @@ variant_select_mode = "version_priority"
 # separately (``pip install pyrer``).
 #
 # Note that the rer-backed solver is currently feature-reduced compared to
-# the default solver: callbacks, custom package orderers, ephemeral
-# requirement output, and the full step-by-step resolve graph are not
-# propagated. Solves that require any of those should continue to use the
-# default solver.
+# the default solver: callbacks, custom package orderers, and the full
+# step-by-step resolve graph are not propagated. Solves that require any
+# of those should continue to use the default solver.
 use_rer_solver = False
 
 # One or more filters can be listed, each with a list of

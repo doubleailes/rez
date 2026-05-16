@@ -14,8 +14,6 @@ surface that :class:`rez.resolver.Resolver` relies on.
 Currently unsupported (the default Python solver should still be used if
 any of these matter):
 
-- Ephemeral packages in the request are accepted but ``resolved_ephemerals``
-  is always returned empty (``pyrer`` does not expose them).
 - ``get_graph()`` returns a minimal graph showing only the resolved
   variants; the rich step-by-step graph produced by the Python solver is
   not reconstructed.
@@ -257,7 +255,10 @@ class RerSolver:
                 self._make_package_variant(rv)
                 for rv in result.resolved_packages
             ]
-            self._resolved_ephemerals = []
+            # `resolved_ephemerals` was added in pyrer 0.1.0-rc.7; older
+            # builds lack the attribute and degrade to an empty list.
+            ephemeral_strs = getattr(result, "resolved_ephemerals", None) or []
+            self._resolved_ephemerals = [Requirement(s) for s in ephemeral_strs]
         elif status_str == "failed":
             self._status = SolverStatus.failed
             self._failure_description = result.failure_description or ""
