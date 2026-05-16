@@ -425,19 +425,25 @@ class Resolver(object):
         return str(tuple(t))
 
     def _solve(self) -> Solver:
-        solver = Solver(package_requests=self.package_requests,
-                        package_paths=self.package_paths,
-                        context=self.context,
-                        package_filter=self.package_filter,
-                        package_orderers=self.package_orderers,
-                        callback=self.callback,
-                        package_load_callback=self.package_load_callback,
-                        building=self.building,
-                        verbosity=self.verbosity,
-                        prune_unfailed=config.prune_failed_graph,
-                        buf=self.buf,
-                        suppress_passive=self.suppress_passive,
-                        print_stats=self.print_stats)
+        if config.use_rer_solver:
+            from rez.rer_solver import RerSolver
+            solver_cls: type = RerSolver
+        else:
+            solver_cls = Solver
+
+        solver = solver_cls(package_requests=self.package_requests,
+                            package_paths=self.package_paths,
+                            context=self.context,
+                            package_filter=self.package_filter,
+                            package_orderers=self.package_orderers,
+                            callback=self.callback,
+                            package_load_callback=self.package_load_callback,
+                            building=self.building,
+                            verbosity=self.verbosity,
+                            prune_unfailed=config.prune_failed_graph,
+                            buf=self.buf,
+                            suppress_passive=self.suppress_passive,
+                            print_stats=self.print_stats)
         solver.solve()
 
         return solver

@@ -396,6 +396,20 @@ prune_failed_graph = True
 # original request (burgle).
 variant_select_mode = "version_priority"
 
+# Use the Rust-backed ``pyrer`` solver instead of rez's built-in Python
+# solver. When enabled, dependency resolves are delegated to the ``pyrer``
+# package (see https://github.com/doubleailes/rer), which is a faithful
+# reimplementation of rez's solver algorithm in Rust and is significantly
+# faster on most workloads. The ``pyrer`` package must be installed
+# separately (``pip install pyrer``).
+#
+# Note that the rer-backed solver is currently feature-reduced compared to
+# the default solver: callbacks, custom package orderers, ephemeral
+# requirement output, and the full step-by-step resolve graph are not
+# propagated. Solves that require any of those should continue to use the
+# default solver.
+use_rer_solver = False
+
 # One or more filters can be listed, each with a list of
 # exclusion and inclusion rules. These filters are applied to each package
 # during a resolve, and if any filter excludes a package, that package is not
