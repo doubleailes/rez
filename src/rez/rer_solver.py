@@ -11,6 +11,13 @@ algorithm to the Rust implementation in ``pyrer``
 (see https://github.com/doubleailes/rer), while preserving the public
 surface that :class:`rez.resolver.Resolver` relies on.
 
+Package discovery is driven by ``pyrer.solve``'s ``load_family`` callback
+(added in pyrer 0.1.0-rc.8). Each rez package family is materialised on
+demand the first time the solver asks for it, mirroring the lazy
+``package.py`` evaluation that rez's own solver gets for free. On older
+pyrer builds the shim falls back to BFS-discovering every reachable
+family up front before handing them to the solver.
+
 Currently unsupported (the default Python solver should still be used if
 any of these matter):
 
@@ -52,6 +59,15 @@ def _import_pyrer() -> Any:
             "(see https://github.com/doubleailes/rer)."
         ) from e
     return pyrer
+
+
+def _supports_load_family(pyrer: Any) -> bool:
+    """True if pyrer.solve accepts the load_family kwarg (>= 0.1.0-rc.8)."""
+    try:
+        import inspect
+        return "load_family" in inspect.signature(pyrer.solve).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 class RerSolver:
@@ -177,7 +193,6 @@ class RerSolver:
         pt1 = package_repo_stats.package_load_time
 
         try:
-            packages = self._collect_packages(pyrer)
             request_strs = [str(r) for r in self.package_requests]
 
             # Mirror config.variant_select_mode. Import locally to avoid a
@@ -186,11 +201,20 @@ class RerSolver:
             mode = getattr(config, "variant_select_mode", None) \
                 or "version_priority"
 
-            result = pyrer.solve(
-                request_strs,
-                packages,
-                variant_select_mode=mode,
-            )
+            if _supports_load_family(pyrer):
+                result = pyrer.solve(
+                    request_strs,
+                    None,
+                    load_family=lambda name: self._load_family(pyrer, name),
+                    variant_select_mode=mode,
+                )
+            else:
+                # pyrer < 0.1.0-rc.8: fall back to eager BFS materialisation.
+                result = pyrer.solve(
+                    request_strs,
+                    self._collect_packages_eager(pyrer),
+                    variant_select_mode=mode,
+                )
         finally:
             self.load_time = package_repo_stats.package_load_time - pt1
             self.solve_time = time.time() - t1
@@ -214,35 +238,57 @@ class RerSolver:
             "backend": "pyrer",
         }
 
-    def _collect_packages(self, pyrer: Any) -> list[Any]:
-        """BFS over package families reachable from the request and feed
-        :class:`pyrer.PackageData` instances back to the caller.
+    def _load_family(self, pyrer: Any, name: str) -> list[Any]:
+        """Lazy ``load_family`` callback fed to ``pyrer.solve``.
+
+        Materialises one rez package family into :class:`pyrer.PackageData`
+        instances, honouring the configured ``package_filter`` and firing
+        ``package_load_callback`` per package, exactly like the default
+        Python solver does on demand.
+        """
+        if not name or name.startswith('.'):
+            return []
+        out: list[Any] = []
+        for pkg in iter_packages(name, paths=self.package_paths):
+            if self.package_filter is not None and \
+                    self.package_filter.excludes(pkg):
+                continue
+            if self.package_load_callback is not None:
+                self.package_load_callback(pkg)
+            out.append(pyrer.PackageData.from_rez(pkg))
+        return out
+
+    def _collect_packages_eager(self, pyrer: Any) -> list[Any]:
+        """Eager BFS used as a fallback for pyrer < 0.1.0-rc.8 (no
+        ``load_family`` callback).
         """
         out: list[Any] = []
         seen: set[str] = set()
         queue: list[str] = []
 
-        def _enqueue(name: str) -> None:
-            if not name or name.startswith('.'):
+        def _enqueue(family: str) -> None:
+            if not family or family.startswith('.'):
                 return
-            if name in seen:
+            if family in seen:
                 return
-            seen.add(name)
-            queue.append(name)
+            seen.add(family)
+            queue.append(family)
 
         for req in self.package_requests:
             if not req.conflict:
                 _enqueue(req.name)
 
         while queue:
-            name = queue.pop(0)
-            for pkg in iter_packages(name, paths=self.package_paths):
+            family = queue.pop(0)
+            for pd in self._load_family(pyrer, family):
+                out.append(pd)
+            # Walk the rez packages again to discover dependent families.
+            # Cheap relative to the package.py evaluation in _load_family,
+            # and the iter_packages results are cached by the repo layer.
+            for pkg in iter_packages(family, paths=self.package_paths):
                 if self.package_filter is not None and \
                         self.package_filter.excludes(pkg):
                     continue
-                if self.package_load_callback is not None:
-                    self.package_load_callback(pkg)
-                out.append(pyrer.PackageData.from_rez(pkg))
                 for dep_name in _gather_dependency_families(pkg):
                     _enqueue(dep_name)
         return out

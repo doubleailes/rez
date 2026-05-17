@@ -75,6 +75,29 @@ class TestRerSolver(TestBase):
         self.assertIsNone(s.resolved_packages)
         self.assertTrue(s.failure_description())
 
+    def test_load_family_is_lazy(self) -> None:
+        """When pyrer supports load_family, irrelevant families aren't loaded."""
+        from rez.rer_solver import _supports_load_family
+        import pyrer
+        if not _supports_load_family(pyrer):
+            self.skipTest("pyrer < 0.1.0-rc.8 has no load_family callback")
+
+        loaded: list[str] = []
+        s = self._make_solver(["python"])
+        original = s.package_load_callback
+
+        def recording_callback(pkg) -> None:
+            loaded.append(pkg.name)
+            if original is not None:
+                original(pkg)
+
+        s.package_load_callback = recording_callback
+        s.solve()
+        self.assertEqual(s.status, SolverStatus.solved)
+        # Only the python family should have been touched - not pyvariants,
+        # nada, pyfoo, etc.
+        self.assertEqual(set(loaded), {"python"})
+
     def test_resolved_ephemerals(self) -> None:
         """pyrer >= 0.1.0-rc.7 surfaces resolved ephemeral ranges."""
         s = self._make_solver([".feature-1+<3", ".feature-2+"])
