@@ -255,7 +255,7 @@ class RerSolver:
                 continue
             if self.package_load_callback is not None:
                 self.package_load_callback(pkg)
-            out.append(pyrer.PackageData.from_rez(pkg))
+            out.append(_make_package_data(pyrer, pkg))
         return out
 
     def _collect_packages_eager(self, pyrer: Any) -> list[Any]:
@@ -340,3 +340,41 @@ def _gather_dependency_families(pkg: Package) -> set[str]:
         for req in (variant or []):
             names.add(req.name)
     return names
+
+
+def _make_package_data(pyrer: Any, pkg: Package) -> Any:
+    """Build a ``pyrer.PackageData`` from a rez ``Package`` via the raw
+    ``pkg.data`` dict.
+
+    ``pkg.data`` holds the schema values as plain strings
+    (``"requires": ["python-3+", ...]``, ``"variants": [["python-3"], ...]``)
+    so PyO3 can extract straight into ``Vec<String>`` / ``Vec<Vec<String>>``
+    without instantiating any ``rez.Requirement`` objects or paying for
+    ``str()`` per element. ``from_rez`` is used as a fallback when an
+    attribute is late-bound (a ``SourceCode`` instance), since that
+    requires the wrapper's evaluation path.
+    """
+    data = pkg.data
+    requires = data.get("requires")
+    variants = data.get("variants")
+
+    if _is_late_bound(requires) or _is_late_bound(variants):
+        return pyrer.PackageData.from_rez(pkg)
+    if variants is not None and any(_is_late_bound(v) for v in variants):
+        return pyrer.PackageData.from_rez(pkg)
+
+    return pyrer.PackageData(
+        data["name"],
+        str(data["version"]),
+        list(requires) if requires else [],
+        [list(v) for v in variants] if variants else [],
+    )
+
+
+def _is_late_bound(value: Any) -> bool:
+    """Detect late-bound source code stored in a ``pkg.data`` slot."""
+    if value is None or isinstance(value, (str, list)):
+        return False
+    # Defer the import to avoid the cost on the common path.
+    from rez.utils.sourcecode import SourceCode
+    return isinstance(value, SourceCode)
