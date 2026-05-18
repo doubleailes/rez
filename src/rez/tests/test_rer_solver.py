@@ -78,7 +78,6 @@ class TestRerSolver(TestBase):
     def test_load_family_is_lazy(self) -> None:
         """When pyrer supports load_family, irrelevant families aren't loaded."""
         from rez.rer_solver import _supports_load_family
-        import pyrer
         if not _supports_load_family(pyrer):
             self.skipTest("pyrer < 0.1.0-rc.8 has no load_family callback")
 
