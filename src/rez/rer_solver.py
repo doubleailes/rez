@@ -1,0 +1,380 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the Rez Project
+
+
+"""
+Rust-backed alternative solver, powered by the ``pyrer`` package.
+
+This module provides a drop-in replacement for :class:`rez.solver.Solver`,
+used when ``config.use_rer_solver`` is True. It delegates the core resolve
+algorithm to the Rust implementation in ``pyrer``
+(see https://github.com/doubleailes/rer), while preserving the public
+surface that :class:`rez.resolver.Resolver` relies on.
+
+Package discovery is driven by ``pyrer.solve``'s ``load_family`` callback
+(added in pyrer 0.1.0-rc.8). Each rez package family is materialised on
+demand the first time the solver asks for it, mirroring the lazy
+``package.py`` evaluation that rez's own solver gets for free. On older
+pyrer builds the shim falls back to BFS-discovering every reachable
+family up front before handing them to the solver.
+
+Currently unsupported (the default Python solver should still be used if
+any of these matter):
+
+- ``get_graph()`` returns a minimal graph showing only the resolved
+  variants; the rich step-by-step graph produced by the Python solver is
+  not reconstructed.
+- Solver callbacks, custom package orderers, verbose printing, and
+  advanced solve statistics are silently ignored.
+- Cyclic-dependency detection is left to ``pyrer``; failures are reported
+  as plain :attr:`SolverStatus.failed` rather than ``cyclic``.
+"""
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING, Any, Callable
+
+from rez.exceptions import RezSystemError
+from rez.package_repository import package_repo_stats
+from rez.packages import get_package, iter_packages
+from rez.solver import PackageVariant, SolverCallbackReturn, SolverStatus
+from rez.vendor.pygraph.classes.digraph import digraph
+from rez.version import Requirement
+
+if TYPE_CHECKING:
+    from rez.package_filter import PackageFilterBase
+    from rez.package_order import PackageOrderList
+    from rez.packages import Package
+    from rez.resolved_context import ResolvedContext
+    from rez.utils.typing import SupportsWrite
+
+
+def _import_pyrer() -> Any:
+    try:
+        import pyrer
+    except ImportError as e:
+        raise RezSystemError(
+            "The 'pyrer' package is required when 'use_rer_solver' is "
+            "enabled. Install it with 'pip install pyrer' "
+            "(see https://github.com/doubleailes/rer)."
+        ) from e
+    return pyrer
+
+
+def _supports_load_family(pyrer: Any) -> bool:
+    """True if pyrer.solve accepts the load_family kwarg (>= 0.1.0-rc.8)."""
+    try:
+        import inspect
+        return "load_family" in inspect.signature(pyrer.solve).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+class RerSolver:
+    """A :class:`rez.solver.Solver`-compatible front-end that delegates the
+    resolve to :func:`pyrer.solve`.
+
+    Only the attributes that :meth:`rez.resolver.Resolver._solver_to_dict`
+    reads are guaranteed to be populated; everything else is best-effort.
+    """
+
+    max_verbosity = 3
+
+    def __init__(self,
+                 package_requests: list[Requirement],
+                 package_paths: list[str],
+                 context: ResolvedContext | None = None,
+                 package_filter: PackageFilterBase | None = None,
+                 package_orderers: PackageOrderList | None = None,
+                 callback: Callable | None = None,
+                 building: bool = False,
+                 optimised: bool = True,
+                 verbosity: int = 0,
+                 buf: SupportsWrite | None = None,
+                 package_load_callback: Callable[[Package], Any] | None = None,
+                 prune_unfailed: bool = True,
+                 suppress_passive: bool = False,
+                 print_stats: bool = False) -> None:
+        self.package_requests = list(package_requests)
+        self.package_paths = package_paths
+        self.context = context
+        self.package_filter = package_filter
+        self.package_orderers = package_orderers
+        self.callback = callback
+        self.building = building
+        self.optimised = optimised
+        self.verbosity = verbosity
+        self.buf = buf
+        self.package_load_callback = package_load_callback
+        self.prune_unfailed = prune_unfailed
+        self.suppress_passive = suppress_passive
+        self.print_stats = print_stats
+
+        # Solver-compatible state read by Resolver._solver_to_dict.
+        self.solve_time: float | None = None
+        self.load_time: float | None = None
+        self.abort_reason: str | None = None
+        self.callback_return: SolverCallbackReturn | None = None
+        self.solve_begun: bool = False
+
+        self._status: SolverStatus = SolverStatus.pending
+        self._resolved_packages: list[PackageVariant] | None = None
+        self._resolved_ephemerals: list[Requirement] | None = None
+        self._failure_description: str = ""
+        self._num_iterations: int = 0
+
+    @property
+    def status(self) -> SolverStatus:
+        return self._status
+
+    @property
+    def num_solves(self) -> int:
+        return self._num_iterations
+
+    @property
+    def num_fails(self) -> int:
+        return 1 if self._status == SolverStatus.failed else 0
+
+    @property
+    def cyclic_fail(self) -> bool:
+        return False
+
+    @property
+    def resolved_packages(self) -> list[PackageVariant] | None:
+        if self._status != SolverStatus.solved:
+            return None
+        return self._resolved_packages
+
+    @property
+    def resolved_ephemerals(self) -> list[Requirement] | None:
+        if self._status != SolverStatus.solved:
+            return None
+        return self._resolved_ephemerals
+
+    def failure_description(self, failure_index: int | None = None) -> str:
+        return self._failure_description
+
+    def failure_reason(self, failure_index: int | None = None):
+        # pyrer returns a free-form description; the structured FailureReason
+        # objects are not reconstructed.
+        return None
+
+    def failure_packages(self, failure_index: int | None = None):
+        return None
+
+    def get_graph(self) -> digraph:
+        """Return a minimal graph; pyrer does not expose the resolve graph."""
+        g = digraph()
+        if self._resolved_packages:
+            for pv in self._resolved_packages:
+                node = str(pv)
+                if not g.has_node(node):
+                    g.add_node(node)
+        return g
+
+    def reset(self) -> None:
+        self.solve_begun = False
+        self._status = SolverStatus.pending
+        self._resolved_packages = None
+        self._resolved_ephemerals = None
+        self._failure_description = ""
+        self._num_iterations = 0
+
+    def solve(self) -> None:
+        if self.solve_begun:
+            raise RezSystemError(
+                "cannot run solve() on a solve that has already been started"
+            )
+        self.solve_begun = True
+
+        pyrer = _import_pyrer()
+
+        t1 = time.time()
+        pt1 = package_repo_stats.package_load_time
+
+        try:
+            request_strs = [str(r) for r in self.package_requests]
+
+            # Mirror config.variant_select_mode. Import locally to avoid a
+            # cycle at module load time.
+            from rez.config import config
+            mode = getattr(config, "variant_select_mode", None) \
+                or "version_priority"
+
+            if _supports_load_family(pyrer):
+                result = pyrer.solve(
+                    request_strs,
+                    None,
+                    load_family=lambda name: self._load_family(pyrer, name),
+                    variant_select_mode=mode,
+                )
+            else:
+                # pyrer < 0.1.0-rc.8: fall back to eager BFS materialisation.
+                result = pyrer.solve(
+                    request_strs,
+                    self._collect_packages_eager(pyrer),
+                    variant_select_mode=mode,
+                )
+        finally:
+            self.load_time = package_repo_stats.package_load_time - pt1
+            self.solve_time = time.time() - t1
+
+        self._num_iterations = int(getattr(result, "num_iterations", 0) or 0)
+        self._consume_result(result)
+
+    @property
+    def solve_stats(self) -> dict[str, dict[str, Any]]:
+        global_stats = {
+            "num_solves": self.num_solves,
+            "num_fails": self.num_fails,
+            "solve_time": self.solve_time,
+            "load_time": self.load_time,
+        }
+        return {
+            "global": global_stats,
+            "extractions": {},
+            "intersections": {},
+            "reductions": {},
+            "backend": "pyrer",
+        }
+
+    def _load_family(self, pyrer: Any, name: str) -> list[Any]:
+        """Lazy ``load_family`` callback fed to ``pyrer.solve``.
+
+        Materialises one rez package family into :class:`pyrer.PackageData`
+        instances, honouring the configured ``package_filter`` and firing
+        ``package_load_callback`` per package, exactly like the default
+        Python solver does on demand.
+        """
+        if not name or name.startswith('.'):
+            return []
+        out: list[Any] = []
+        for pkg in iter_packages(name, paths=self.package_paths):
+            if self.package_filter is not None and \
+                    self.package_filter.excludes(pkg):
+                continue
+            if self.package_load_callback is not None:
+                self.package_load_callback(pkg)
+            out.append(_make_package_data(pyrer, pkg))
+        return out
+
+    def _collect_packages_eager(self, pyrer: Any) -> list[Any]:
+        """Eager BFS used as a fallback for pyrer < 0.1.0-rc.8 (no
+        ``load_family`` callback).
+        """
+        out: list[Any] = []
+        seen: set[str] = set()
+        queue: list[str] = []
+
+        def _enqueue(family: str) -> None:
+            if not family or family.startswith('.'):
+                return
+            if family in seen:
+                return
+            seen.add(family)
+            queue.append(family)
+
+        for req in self.package_requests:
+            if not req.conflict:
+                _enqueue(req.name)
+
+        while queue:
+            family = queue.pop(0)
+            for pd in self._load_family(pyrer, family):
+                out.append(pd)
+            # Walk the rez packages again to discover dependent families.
+            # Cheap relative to the package.py evaluation in _load_family,
+            # and the iter_packages results are cached by the repo layer.
+            for pkg in iter_packages(family, paths=self.package_paths):
+                if self.package_filter is not None and \
+                        self.package_filter.excludes(pkg):
+                    continue
+                for dep_name in _gather_dependency_families(pkg):
+                    _enqueue(dep_name)
+        return out
+
+    def _consume_result(self, result: Any) -> None:
+        status_str = getattr(result, "status", "error")
+        if status_str == "solved":
+            self._status = SolverStatus.solved
+            self._resolved_packages = [
+                self._make_package_variant(rv)
+                for rv in result.resolved_packages
+            ]
+            # `resolved_ephemerals` was added in pyrer 0.1.0-rc.7; older
+            # builds lack the attribute and degrade to an empty list.
+            ephemeral_strs = getattr(result, "resolved_ephemerals", None) or []
+            self._resolved_ephemerals = [Requirement(s) for s in ephemeral_strs]
+        elif status_str == "failed":
+            self._status = SolverStatus.failed
+            self._failure_description = result.failure_description or ""
+        else:
+            self._status = SolverStatus.failed
+            self._failure_description = (
+                getattr(result, "failure_description", None)
+                or "rer solver reported status %r" % status_str
+            )
+
+    def _make_package_variant(self, rv: Any) -> PackageVariant:
+        pkg = get_package(rv.name, rv.version, paths=self.package_paths)
+        if pkg is None:
+            raise RezSystemError(
+                "rer solver resolved package %s-%s, but it could not be "
+                "loaded from package_paths %r"
+                % (rv.name, rv.version, self.package_paths)
+            )
+        variant = pkg.get_variant(rv.variant_index)
+        if variant is None:
+            raise RezSystemError(
+                "rer solver resolved variant %s-%s[%s], but it could not "
+                "be loaded" % (rv.name, rv.version, rv.variant_index)
+            )
+        return PackageVariant(variant, building=self.building)
+
+
+def _gather_dependency_families(pkg: Package) -> set[str]:
+    names: set[str] = set()
+    for req in (pkg.requires or []):
+        names.add(req.name)
+    for variant in (pkg.variants or []):
+        for req in (variant or []):
+            names.add(req.name)
+    return names
+
+
+def _make_package_data(pyrer: Any, pkg: Package) -> Any:
+    """Build a ``pyrer.PackageData`` from a rez ``Package`` via the raw
+    ``pkg.data`` dict.
+
+    ``pkg.data`` holds the schema values as plain strings
+    (``"requires": ["python-3+", ...]``, ``"variants": [["python-3"], ...]``)
+    so PyO3 can extract straight into ``Vec<String>`` / ``Vec<Vec<String>>``
+    without instantiating any ``rez.Requirement`` objects or paying for
+    ``str()`` per element. ``from_rez`` is used as a fallback when an
+    attribute is late-bound (a ``SourceCode`` instance), since that
+    requires the wrapper's evaluation path.
+    """
+    data = pkg.data
+    requires = data.get("requires")
+    variants = data.get("variants")
+
+    if _is_late_bound(requires) or _is_late_bound(variants):
+        return pyrer.PackageData.from_rez(pkg)
+    if variants is not None and any(_is_late_bound(v) for v in variants):
+        return pyrer.PackageData.from_rez(pkg)
+
+    return pyrer.PackageData(
+        data["name"],
+        str(data["version"]),
+        list(requires) if requires else [],
+        [list(v) for v in variants] if variants else [],
+    )
+
+
+def _is_late_bound(value: Any) -> bool:
+    """Detect late-bound source code stored in a ``pkg.data`` slot."""
+    if value is None or isinstance(value, (str, list)):
+        return False
+    # Defer the import to avoid the cost on the common path.
+    from rez.utils.sourcecode import SourceCode
+    return isinstance(value, SourceCode)

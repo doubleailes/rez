@@ -469,6 +469,7 @@ config_schema = Schema({
     "package_cache_async":                          Bool,
     "color_enabled":                                ForceOrBool,
     "resolve_caching":                              Bool,
+    "use_rer_solver":                               Bool,
     "cache_package_files":                          Bool,
     "cache_listdir":                                Bool,
     "prune_failed_graph":                           Bool,
